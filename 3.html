@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>极简React - 第三步 虚拟DOM + Diff</title>
+    <style>
+        .counter { font-family: Arial; padding: 20px; border: 1px solid #ccc; margin: 10px; }
+        button { margin: 5px; padding: 5px 10px; cursor: pointer; }
+        input { margin: 5px; padding: 5px; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        // ========== 1. 虚拟 DOM 创建函数 ==========
+        function createElement(type, props, ...children) {
+            return {
+                type,
+                props: props || {},
+                children: children.flat().map(child => 
+                    typeof child === 'object' ? child : createTextElement(child)
+                )
+            };
+        }
+
+        function createTextElement(text) {
+            return {
+                type: 'TEXT_ELEMENT',
+                props: { nodeValue: text },
+                children: []
+            };
+        }
+
+        // ========== 2. 虚拟 DOM → 真实 DOM ==========
+        function createDom(vdom) {
+            if (vdom.type === 'TEXT_ELEMENT') {
+                return document.createTextNode(vdom.props.nodeValue);
+            }
+            
+            const dom = document.createElement(vdom.type);
+            
+            // 设置属性
+            Object.keys(vdom.props).forEach(key => {
+                if (key.startsWith('on')) {
+                    // 事件监听
+                    const eventType = key.toLowerCase().substring(2);
+                    dom.addEventListener(eventType, vdom.props[key]);
+                } else {
+                    dom[key] = vdom.props[key];
+                }
+            });
+            
+            // 递归创建子节点
+            vdom.children.forEach(child => {
+                dom.appendChild(createDom(child));
+            });
+            
+            return dom;
+        }
+
+        // ========== 3. Diff 算法（核心！） ==========
+        function updateDom(dom, prevProps, nextProps) {
+            // 3.1 移除旧的事件监听
+            Object.keys(prevProps).forEach(key => {
+                if (key.startsWith('on')) {
+                    const eventType = key.toLowerCase().substring(2);
+                    dom.removeEventListener(eventType, prevProps[key]);
+                }
+            });
+            
+            // 3.2 移除旧的属性
+            Object.keys(prevProps).forEach(key => {
+                if (!key.startsWith('on') && key !== 'children') {
+                    if (!nextProps.hasOwnProperty(key)) {
+                        dom[key] = '';
+                    }
+                }
+            });
+            
+            // 3.3 添加新的事件监听和新属性
+            Object.keys(nextProps).forEach(key => {
+                if (key.startsWith('on')) {
+                    const eventType = key.toLowerCase().substring(2);
+                    dom.addEventListener(eventType, nextProps[key]);
+                } else if (key !== 'children') {
+                    dom[key] = nextProps[key];
+                }
+            });
+        }
+
+        // 比较两个虚拟 DOM 节点（简化版 diff）
+        function reconcile(dom, prevVdom, nextVdom, index = 0) {
+            if (nextVdom === undefined) {
+                // 删除节点
+                dom.remove();
+                return null;
+            }
+            
+            if (prevVdom === undefined) {
+                // 新增节点
+                const newDom = createDom(nextVdom);
+                dom.parentNode.appendChild(newDom);
+                return newDom;
+            }
+            
+            if (prevVdom.type !== nextVdom.type) {
+                // 类型不同，直接替换
+                const newDom = createDom(nextVdom);
+                dom.parentNode.replaceChild(newDom, dom);
+                return newDom;
+            }
+            
+            // 类型相同，更新属性
+            updateDom(dom, prevVdom.props, nextVdom.props);
+            
+            // 递归处理 children
+            const childrenLength = Math.max(
+                prevVdom.children.length,
+                nextVdom.children.length
+            );
+            
+            for (let i = 0; i < childrenLength; i++) {
+                reconcile(
+                    dom.childNodes[i],
+                    prevVdom.children[i],
+                    nextVdom.children[i],
+                    i
+                );
+            }
+            
+            return dom;
+        }
+
+        // ========== 4. React 核心（升级版） ==========
+        let currentlyRenderingComponent = null;
+
+        function useState(initialValue) {
+            const component = currentlyRenderingComponent;
+            
+            if (!component._states) {
+                component._states = [];
+                component._stateIndex = 0;
+            }
+            
+            const index = component._stateIndex++;
+            
+            if (component._states[index] === undefined) {
+                component._states[index] = initialValue;
+            }
+            
+            const setter = (newValue) => {
+                if (typeof newValue === 'function') {
+                    component._states[index] = newValue(component._states[index]);
+                } else {
+                    component._states[index] = newValue;
+                }
+                // 触发重新渲染
+                rerender(component);
+            };
+            
+            return [component._states[index], setter];
+        }
+
+        function rerender(componentInstance) {
+            const container = componentInstance._container;
+            if (!container) return;
+            
+            // 保存旧虚拟 DOM
+            const prevVdom = componentInstance._currentVdom;
+            
+            // 执行组件函数，生成新的虚拟 DOM
+            currentlyRenderingComponent = componentInstance;
+            componentInstance._stateIndex = 0;
+            const newVdom = componentInstance.componentFunction();
+            currentlyRenderingComponent = null;
+            
+            // 保存新虚拟 DOM
+            componentInstance._currentVdom = newVdom;
+            
+            // 如果还没有真实 DOM（首次渲染）
+            if (!componentInstance._dom) {
+                const dom = createDom(newVdom);
+                container.innerHTML = '';
+                container.appendChild(dom);
+                componentInstance._dom = dom;
+            } else {
+                // ✅ 使用 diff 算法更新，而不是替换整个容器
+                reconcile(componentInstance._dom, prevVdom, newVdom);
+            }
+        }
+
+        function createRoot(container) {
+            return {
+                render: (Component) => {
+                    const instance = {
+                        componentFunction: Component,
+                        _container: container,
+                        _states: [],
+                        _stateIndex: 0,
+                        _currentVdom: null,
+                        _dom: null
+                    };
+                    
+                    currentlyRenderingComponent = instance;
+                    instance._stateIndex = 0;
+                    const initialVdom = Component();
+                    currentlyRenderingComponent = null;
+                    
+                    instance._currentVdom = initialVdom;
+                    const dom = createDom(initialVdom);
+                    container.innerHTML = '';
+                    container.appendChild(dom);
+                    instance._dom = dom;
+                }
+            };
+        }
+
+        // ========== 5. 业务组件（使用 JSX 风格的创建函数） ==========
+        function Counter() {
+            const [count, setCount] = useState(0);
+            const [text, setText] = useState('');
+            
+            // 使用虚拟 DOM 创建函数
+            return createElement('div', { className: 'counter' },
+                createElement('h3', {}, `Count: ${count}`),
+                createElement('button', { 
+                    onClick: () => setCount(c => c + 1),
+                    style: 'margin-right: 10px'
+                }, 'Increment'),
+                createElement('button', { 
+                    onClick: () => setCount(0)
+                }, 'Reset'),
+                createElement('br', {}, null),
+                createElement('input', {
+                    type: 'text',
+                    value: text,
+                    placeholder: '请输入文字...',
+                    onInput: (e) => setText(e.target.value)
+                }),
+                createElement('p', {}, `Text: ${text}`),
+                createElement('div', {}, 
+                    `时间戳: ${new Date().toLocaleTimeString()}`
+                )
+            );
+        }
+
+        // ========== 6. 挂载应用 ==========
+        const root = createRoot(document.getElementById('root'));
+        root.render(Counter);
+    </script>
+</body>
+</html>
