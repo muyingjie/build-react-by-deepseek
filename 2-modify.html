@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>极简React - 第二步 useState雏形 (修正版)</title>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        // ---------- 简易 React 核心 ----------
+        let currentlyRenderingComponent = null;   // 当前正在渲染的组件
+
+        function useState(initialValue) {
+            // 关键修复：保存当前正在渲染的组件引用
+            const component = currentlyRenderingComponent;
+            
+            if (!component._states) {
+                component._states = [];
+                component._stateIndex = 0;
+            }
+            
+            const index = component._stateIndex++;
+            const existingState = component._states[index];
+            
+            if (existingState === undefined) {
+                component._states[index] = initialValue;
+            }
+            
+            // setter 通过闭包捕获 component 和 index
+            const setter = (newValue) => {
+                component._states[index] = newValue;
+                rerender(component);
+            };
+            
+            return [component._states[index], setter];
+        }
+
+        // 重新渲染某个组件
+        function rerender(componentInstance) {
+            const container = componentInstance._container;
+            if (!container) return;
+            
+            // 重新执行组件函数，得到新的DOM
+            const newDom = componentInstance.render();
+            
+            // 简单替换
+            container.innerHTML = '';
+            container.appendChild(newDom);
+            componentInstance._dom = newDom;
+        }
+
+        // 创建根组件并挂载
+        function createRoot(container) {
+            return {
+                render: (Component) => {
+                    // 创建一个组件实例
+                    const instance = {
+                        render: () => {
+                            // 重置状态索引
+                            instance._stateIndex = 0;
+                            // 设置当前渲染的组件
+                            currentlyRenderingComponent = instance;
+                            // 执行组件函数
+                            const dom = Component();
+                            // 清空当前组件引用
+                            currentlyRenderingComponent = null;
+                            return dom;
+                        },
+                        _container: container,
+                        _states: [],
+                        _stateIndex: 0
+                    };
+                    
+                    // 首次渲染
+                    const dom = instance.render();
+                    container.innerHTML = '';
+                    container.appendChild(dom);
+                    instance._dom = dom;
+                }
+            };
+        }
+
+        // ---------- 业务组件 ----------
+        function Counter() {
+            const [count, setCount] = useState(0);
+            
+            const div = document.createElement('div');
+            div.textContent = `Count: ${count}`;
+            
+            const button = document.createElement('button');
+            button.textContent = 'Increment';
+            button.onclick = () => setCount(count + 1);
+            
+            const resetBtn = document.createElement('button');
+            resetBtn.textContent = 'Reset';
+            resetBtn.onclick = () => setCount(0);
+            
+            div.appendChild(button);
+            div.appendChild(resetBtn);
+            return div;
+        }
+
+        // ---------- 挂载应用 ----------
+        const root = createRoot(document.getElementById('root'));
+        root.render(Counter);
+    </script>
+</body>
+</html>
