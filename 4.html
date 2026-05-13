@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>极简React - 第四步 基于Key的Diff优化</title>
+    <style>
+        .counter { font-family: Arial; padding: 20px; border: 1px solid #ccc; margin: 10px; }
+        button { margin: 5px; padding: 5px 10px; cursor: pointer; }
+        input { margin: 5px; padding: 5px; }
+        .todo-item { margin: 5px 0; display: flex; align-items: center; gap: 10px; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        // ========== 1. 虚拟 DOM 创建函数 ==========
+        function createElement(type, props, ...children) {
+            return {
+                type,
+                props: props || {},
+                children: children.flat().map(child => 
+                    typeof child === 'object' ? child : createTextElement(child)
+                )
+            };
+        }
+
+        function createTextElement(text) {
+            return {
+                type: 'TEXT_ELEMENT',
+                props: { nodeValue: text },
+                children: []
+            };
+        }
+
+        // ========== 2. 虚拟 DOM → 真实 DOM ==========
+        function createDom(vdom) {
+            if (vdom.type === 'TEXT_ELEMENT') {
+                return document.createTextNode(vdom.props.nodeValue);
+            }
+            
+            const dom = document.createElement(vdom.type);
+            updateDomProps(dom, {}, vdom.props);
+            
+            vdom.children.forEach(child => {
+                dom.appendChild(createDom(child));
+            });
+            
+            return dom;
+        }
+
+        function updateDomProps(dom, prevProps, nextProps) {
+            // 移除旧的事件和属性
+            Object.keys(prevProps).forEach(key => {
+                if (key.startsWith('on')) {
+                    const eventType = key.toLowerCase().substring(2);
+                    dom.removeEventListener(eventType, prevProps[key]);
+                } else if (key !== 'children' && key !== 'key') {
+                    dom[key] = '';
+                }
+            });
+            
+            // 添加新的事件和属性
+            Object.keys(nextProps).forEach(key => {
+                if (key.startsWith('on')) {
+                    const eventType = key.toLowerCase().substring(2);
+                    dom.addEventListener(eventType, nextProps[key]);
+                } else if (key !== 'children' && key !== 'key') {
+                    dom[key] = nextProps[key];
+                }
+            });
+        }
+
+        // ========== 3. 核心：基于 key 的列表 diff ==========
+        function reconcileChildren(dom, prevChildren, nextChildren) {
+            // 构建旧节点的 key-map
+            const oldKeyMap = new Map();
+            const oldNodes = [];
+            
+            for (let i = 0; i < prevChildren.length; i++) {
+                const child = prevChildren[i];
+                const key = child.props?.key || `__index_${i}`;
+                oldKeyMap.set(key, {
+                    vdom: child,
+                    dom: dom.childNodes[i],
+                    index: i
+                });
+                oldNodes.push(dom.childNodes[i]);
+            }
+            
+            // 遍历新节点，尝试复用
+            const newDomList = [];
+            const usedOldKeys = new Set();
+            
+            for (let i = 0; i < nextChildren.length; i++) {
+                const newChild = nextChildren[i];
+                const key = newChild.props?.key || `__index_${i}`;
+                
+                if (oldKeyMap.has(key)) {
+                    // 找到可复用的节点
+                    const oldNode = oldKeyMap.get(key);
+                    usedOldKeys.add(key);
+                    
+                    // 更新属性和 children
+                    if (oldNode.vdom.type === newChild.type) {
+                        // 类型相同，更新属性
+                        updateDomProps(oldNode.dom, oldNode.vdom.props, newChild.props);
+                        // 递归更新 children
+                        reconcileChildren(oldNode.dom, oldNode.vdom.children, newChild.children);
+                        newDomList.push(oldNode.dom);
+                    } else {
+                        // 类型不同，创建新节点替换
+                        const newDom = createDom(newChild);
+                        oldNode.dom.parentNode.replaceChild(newDom, oldNode.dom);
+                        newDomList.push(newDom);
+                    }
+                } else {
+                    // 新节点，直接创建
+                    const newDom = createDom(newChild);
+                    newDomList.push(newDom);
+                }
+            }
+            
+            // 删除未使用的旧节点
+            for (let i = 0; i < prevChildren.length; i++) {
+                const child = prevChildren[i];
+                const key = child.props?.key || `__index_${i}`;
+                if (!usedOldKeys.has(key)) {
+                    const oldDom = oldKeyMap.get(key).dom;
+                    oldDom.remove();
+                }
+            }
+            
+            // 重新排列 DOM 顺序（保持正确的位置）
+            for (let i = 0; i < newDomList.length; i++) {
+                const currentDom = newDomList[i];
+                const targetDom = dom.childNodes[i];
+                if (currentDom !== targetDom) {
+                    dom.insertBefore(currentDom, targetDom);
+                }
+            }
+        }
+
+        function reconcile(dom, prevVdom, nextVdom) {
+            if (!nextVdom) {
+                dom.remove();
+                return null;
+            }
+            
+            if (!prevVdom) {
+                const newDom = createDom(nextVdom);
+                dom.parentNode?.appendChild(newDom);
+                return newDom;
+            }
+            
+            if (prevVdom.type !== nextVdom.type) {
+                const newDom = createDom(nextVdom);
+                dom.parentNode.replaceChild(newDom, dom);
+                return newDom;
+            }
+            
+            // 类型相同，更新属性和 children
+            updateDomProps(dom, prevVdom.props, nextVdom.props);
+            reconcileChildren(dom, prevVdom.children, nextVdom.children);
+            
+            return dom;
+        }
+
+        // ========== 4. React 核心 ==========
+        let currentlyRenderingComponent = null;
+
+        function useState(initialValue) {
+            const component = currentlyRenderingComponent;
+            
+            if (!component._states) {
+                component._states = [];
+                component._stateIndex = 0;
+            }
+            
+            const index = component._stateIndex++;
+            
+            if (component._states[index] === undefined) {
+                component._states[index] = initialValue;
+            }
+            
+            const setter = (newValue) => {
+                if (typeof newValue === 'function') {
+                    component._states[index] = newValue(component._states[index]);
+                } else {
+                    component._states[index] = newValue;
+                }
+                rerender(component);
+            };
+            
+            return [component._states[index], setter];
+        }
+
+        function rerender(componentInstance) {
+            const container = componentInstance._container;
+            if (!container) return;
+            
+            const prevVdom = componentInstance._currentVdom;
+            
+            currentlyRenderingComponent = componentInstance;
+            componentInstance._stateIndex = 0;
+            const newVdom = componentInstance.componentFunction();
+            currentlyRenderingComponent = null;
+            
+            componentInstance._currentVdom = newVdom;
+            
+            if (!componentInstance._dom) {
+                const dom = createDom(newVdom);
+                container.innerHTML = '';
+                container.appendChild(dom);
+                componentInstance._dom = dom;
+            } else {
+                reconcile(componentInstance._dom, prevVdom, newVdom);
+            }
+        }
+
+        function createRoot(container) {
+            return {
+                render: (Component) => {
+                    const instance = {
+                        componentFunction: Component,
+                        _container: container,
+                        _states: [],
+                        _stateIndex: 0,
+                        _currentVdom: null,
+                        _dom: null
+                    };
+                    
+                    currentlyRenderingComponent = instance;
+                    instance._stateIndex = 0;
+                    const initialVdom = Component();
+                    currentlyRenderingComponent = null;
+                    
+                    instance._currentVdom = initialVdom;
+                    const dom = createDom(initialVdom);
+                    container.innerHTML = '';
+                    container.appendChild(dom);
+                    instance._dom = dom;
+                }
+            };
+        }
+
+        // ========== 5. TodoList 组件 ==========
+        function TodoList() {
+            const [todos, setTodos] = useState([
+                { id: 1, text: '学习虚拟 DOM', done: false },
+                { id: 2, text: '实现 Diff 算法', done: false },
+            ]);
+            const [input, setInput] = useState('');
+
+            const addTodo = () => {
+                const trimmed = input.trim();
+                if (!trimmed) return;
+                setTodos(prev => [
+                    ...prev,
+                    { id: Date.now(), text: trimmed, done: false }
+                ]);
+                setInput('');
+            };
+
+            const toggleTodo = (id) => {
+                setTodos(prev => prev.map(t =>
+                    t.id === id ? { ...t, done: !t.done } : t
+                ));
+            };
+
+            const removeTodo = (id) => {
+                setTodos(prev => prev.filter(t => t.id !== id));
+            };
+
+            return createElement('div', { className: 'counter' },
+                createElement('h3', {}, 'TodoList（支持 Key 优化）'),
+                createElement('div', {},
+                    createElement('input', {
+                        type: 'text',
+                        value: input,
+                        placeholder: '输入任务...',
+                        onInput: (e) => setInput(e.target.value),
+                    }),
+                    createElement('button', { onClick: addTodo }, '添加'),
+                ),
+                ...todos.map(todo =>
+                    createElement('div', { 
+                        key: todo.id,  // ✅ 关键：提供唯一 key
+                        className: 'todo-item' 
+                    },
+                        createElement('input', {
+                            type: 'checkbox',
+                            checked: todo.done,
+                            onChange: () => toggleTodo(todo.id),
+                        }),
+                        createElement('span', {
+                            style: todo.done ? 'text-decoration: line-through; color: #999' : ''
+                        }, ` ${todo.text} `),
+                        createElement('button', { onClick: () => removeTodo(todo.id) }, '删除'),
+                    )
+                ),
+                createElement('p', {}, `共 ${todos.length} 项，已完成 ${todos.filter(t => t.done).length} 项`)
+            );
+        }
+
+        // ========== 6. 演示性能对比 ==========
+        function PerformanceDemo() {
+            const [items, setItems] = useState(['A', 'B', 'C', 'D']);
+            
+            const insertAtFront = () => {
+                setItems(prev => [String.fromCharCode(65 + Math.random() * 26), ...prev]);
+            };
+            
+            const insertAtEnd = () => {
+                setItems(prev => [...prev, String.fromCharCode(65 + Math.random() * 26)]);
+            };
+            
+            const removeFirst = () => {
+                setItems(prev => prev.slice(1));
+            };
+            
+            return createElement('div', { className: 'counter' },
+                createElement('h3', {}, '性能对比演示'),
+                createElement('div', {},
+                    createElement('button', { onClick: insertAtFront }, '在开头插入'),
+                    createElement('button', { onClick: insertAtEnd }, '在结尾插入'),
+                    createElement('button', { onClick: removeFirst }, '删除第一个'),
+                ),
+                ...items.map((item, idx) => 
+                    createElement('div', { key: `${item}_${idx}` },  // 注意：这里只是演示，实际应该用唯一ID
+                        `${item} - DOM 节点: ${Math.random().toString(36).substr(2, 5)}`
+                    )
+                )
+            );
+        }
+
+        // ========== 7. 挂载应用 ==========
+        const root = createRoot(document.getElementById('root'));
+        root.render(TodoList);
+        // 可以切换组件测试性能
+        // root.render(PerformanceDemo);
+    </script>
+</body>
+</html>
