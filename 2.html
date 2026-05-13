@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>极简React - 第二步 useState雏形</title>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        // ---------- 简易 React 核心 ----------
+        let currentComponent = null;   // 当前正在渲染的组件实例
+
+        function useState(initialValue) {
+            // 为当前组件找到或创建状态槽
+            if (!currentComponent._states) {
+                currentComponent._states = [];
+                currentComponent._stateIndex = 0;
+            }
+            
+            const index = currentComponent._stateIndex++;
+            const existingState = currentComponent._states[index];
+            
+            // 如果还没有这个状态，初始化
+            if (existingState === undefined) {
+                currentComponent._states[index] = initialValue;
+            }
+            
+            const setter = (newValue) => {
+                // 更新状态
+                currentComponent._states[index] = newValue;
+                // 重新渲染当前组件
+                rerender(currentComponent);
+            };
+            
+            return [currentComponent._states[index], setter];
+        }
+
+        // 重新渲染某个组件
+        function rerender(componentInstance) {
+            // 保存旧的DOM容器
+            const container = componentInstance._container;
+            if (!container) return;
+            
+            // 重新执行组件函数，得到新的DOM
+            const newDom = componentInstance.render();
+            
+            // 简单替换（真实React是patch diff）
+            container.innerHTML = '';
+            container.appendChild(newDom);
+            
+            // 更新实例引用（为新生成的DOM绑定组件上下文）
+            componentInstance._dom = newDom;
+        }
+
+        // 创建根组件并挂载
+        function createRoot(container) {
+            return {
+                render: (Component) => {
+                    // 创建一个组件实例
+                    const instance = {
+                        render: () => {
+                            // 重置状态索引，准备执行组件
+                            instance._stateIndex = 0;
+                            currentComponent = instance;
+                            const dom = Component();
+                            currentComponent = null;
+                            return dom;
+                        },
+                        _container: container,
+                        _states: [],      // 存储这个组件的所有useState值
+                        _stateIndex: 0
+                    };
+                    
+                    // 首次渲染
+                    const dom = instance.render();
+                    container.innerHTML = '';
+                    container.appendChild(dom);
+                    instance._dom = dom;
+                }
+            };
+        }
+
+        // ---------- 业务组件 ----------
+        function Counter() {
+            const [count, setCount] = useState(0);
+            
+            const div = document.createElement('div');
+            div.textContent = `Count: ${count}`;
+            
+            const button = document.createElement('button');
+            button.textContent = 'Increment';
+            button.onclick = () => setCount(count + 1);
+            
+            const resetBtn = document.createElement('button');
+            resetBtn.textContent = 'Reset';
+            resetBtn.onclick = () => setCount(0);
+            
+            div.appendChild(button);
+            div.appendChild(resetBtn);
+            return div;
+        }
+
+        // ---------- 挂载应用 ----------
+        const root = createRoot(document.getElementById('root'));
+        root.render(Counter);
+    </script>
+</body>
+</html>
