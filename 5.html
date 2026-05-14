@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>极简React - 第五步 Fiber架构与可中断渲染</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .component { padding: 15px; margin: 10px 0; border: 1px solid #ccc; border-radius: 5px; }
+        button { margin: 5px; padding: 8px 15px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 3px; }
+        button:hover { background: #0056b3; }
+        input { padding: 8px; margin: 5px; border: 1px solid #ccc; border-radius: 3px; }
+        .todo-item { display: flex; align-items: center; gap: 10px; margin: 5px 0; padding: 5px; background: #f9f9f9; }
+        .progress-bar { width: 100%; height: 5px; background: #e0e0e0; margin-top: 10px; }
+        .progress-fill { height: 100%; background: #4caf50; transition: width 0.3s; }
+        .stats { font-size: 12px; color: #666; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script>
+        // ========== 1. 虚拟 DOM 基础函数 ==========
+        function createElement(type, props, ...children) {
+            return {
+                type,
+                props: props || {},
+                children: children.flat().map(child => 
+                    typeof child === 'object' ? child : createTextElement(child)
+                )
+            };
+        }
+
+        function createTextElement(text) {
+            return {
+                type: 'TEXT_ELEMENT',
+                props: { nodeValue: text },
+                children: []
+            };
+        }
+
+        // ========== 2. Fiber 核心数据结构 ==========
+        // Fiber 节点代表一个工作单元
+        let nextUnitOfWork = null;      // 下一个要执行的工作单元
+        let wipRoot = null;             // work in progress root (正在构建中的根节点)
+        let currentRoot = null;         // 上一次提交到 DOM 的根节点
+        let deletions = null;           // 需要删除的节点列表
+
+        // 创建 Fiber 节点
+        function createFiber(vdom, parentFiber) {
+            return {
+                type: vdom.type,
+                props: vdom.props,
+                children: vdom.children,
+                parent: parentFiber,
+                sibling: null,
+                child: null,
+                dom: null,              // 对应的真实 DOM 节点
+                alternate: null,        // 指向上一次提交的 fiber 节点（用于 diff）
+                effectTag: null,        // 操作类型：PLACEMENT, UPDATE, DELETION
+            };
+        }
+
+        // ========== 3. 渲染和提交 ==========
+        function render(element, container) {
+            // 创建根 Fiber
+            wipRoot = {
+                dom: container,
+                props: { children: [element] },
+                parent: null,
+                sibling: null,
+                child: null,
+                alternate: currentRoot,
+            };
+            
+            deletions = [];
+            nextUnitOfWork = wipRoot;
+        }
+
+        // 工作循环（在浏览器空闲时执行）
+        function workLoop(deadline) {
+            let shouldYield = false;
+            
+            while (nextUnitOfWork && !shouldYield) {
+                // 执行当前工作单元，并返回下一个工作单元
+                nextUnitOfWork = performUnitOfWork(nextUnitOfWork);
+                
+                // 检查是否还有剩余时间（如果剩余时间 < 1ms，让出控制权）
+                shouldYield = deadline.timeRemaining() < 1;
+            }
+            
+            // 如果没有更多工作单元，提交整个 fiber 树到 DOM
+            if (!nextUnitOfWork && wipRoot) {
+                commitRoot();
+            }
+            
+            // 继续请求下一次空闲时段
+            requestIdleCallback(workLoop);
+        }
+
+        // 开始工作循环
+        requestIdleCallback(workLoop);
+
+        // ========== 4. 执行工作单元（核心）==========
+        function performUnitOfWork(fiber) {
+            // 1. 创建/更新 DOM 节点
+            if (!fiber.dom && fiber.type) {
+                fiber.dom = createDom(fiber);
+            }
+            
+            // 2. 为子节点创建 fibers
+            reconcileChildren(fiber);
+            
+            // 3. 返回下一个工作单元（深度优先遍历）
+            if (fiber.child) {
+                return fiber.child;
+            }
+            
+            let nextFiber = fiber;
+            while (nextFiber) {
+                if (nextFiber.sibling) {
+                    return nextFiber.sibling;
+                }
+                nextFiber = nextFiber.parent;
+            }
+            
+            return null;
+        }
+
+        // 创建 DOM 节点
+        function createDom(fiber) {
+            if (fiber.type === 'TEXT_ELEMENT') {
+                return document.createTextNode(fiber.props.nodeValue || '');
+            }
+            
+            const dom = document.createElement(fiber.type);
+            updateDomProperties(dom, {}, fiber.props);
+            return dom;
+        }
+
+        // 更新 DOM 属性
+        function updateDomProperties(dom, prevProps, nextProps) {
+            // 移除旧的事件和属性
+            Object.keys(prevProps).forEach(key => {
+                if (key.startsWith('on')) {
+                    const eventType = key.toLowerCase().substring(2);
+                    dom.removeEventListener(eventType, prevProps[key]);
+                } else if (key !== 'children') {
+                    dom[key] = '';
+                }
+            });
+            
+            // 添加新的事件和属性
+            Object.keys(nextProps).forEach(key => {
+                if (key.startsWith('on')) {
+                    const eventType = key.toLowerCase().substring(2);
+                    dom.addEventListener(eventType, nextProps[key]);
+                } else if (key !== 'children') {
+                    dom[key] = nextProps[key];
+                }
+            });
+        }
+
+        // ========== 5. 协调（Diff）子节点 ==========
+        function reconcileChildren(fiber) {
+            // 处理函数组件
+            if (typeof fiber.type === 'function') {
+                return reconcileFunctionComponent(fiber);
+            }
+            
+            // 处理普通组件
+            let prevChild = null;
+            let oldFiber = fiber.alternate?.child;
+            let index = 0;
+            
+            const children = fiber.children || [];
+            
+            while (index < children.length || oldFiber) {
+                const child = children[index];
+                let newFiber = null;
+                
+                // 比较新旧节点类型是否相同
+                const sameType = oldFiber && child && child.type === oldFiber.type;
+                
+                if (sameType) {
+                    // 类型相同，复用节点并更新属性
+                    newFiber = {
+                        type: child.type,
+                        props: child.props,
+                        children: child.children,
+                        parent: fiber,
+                        dom: oldFiber.dom,
+                        alternate: oldFiber,
+                        effectTag: 'UPDATE',
+                    };
+                }
+                
+                if (child && !sameType) {
+                    // 新增节点
+                    newFiber = {
+                        type: child.type,
+                        props: child.props,
+                        children: child.children,
+                        parent: fiber,
+                        dom: null,
+                        alternate: null,
+                        effectTag: 'PLACEMENT',
+                    };
+                }
+                
+                if (oldFiber && !sameType) {
+                    // 删除节点
+                    oldFiber.effectTag = 'DELETION';
+                    deletions.push(oldFiber);
+                }
+                
+                if (oldFiber) {
+                    oldFiber = oldFiber.sibling;
+                }
+                
+                if (index === 0) {
+                    fiber.child = newFiber;
+                } else if (prevChild) {
+                    prevChild.sibling = newFiber;
+                }
+                
+                prevChild = newFiber;
+                index++;
+            }
+        }
+
+        // 处理函数组件
+        function reconcileFunctionComponent(fiber) {
+            // 执行函数组件，获取它返回的虚拟 DOM
+            const component = fiber.type;
+            const children = [component(fiber.props)];
+            
+            let prevChild = null;
+            let oldFiber = fiber.alternate?.child;
+            let index = 0;
+            
+            while (index < children.length || oldFiber) {
+                const child = children[index];
+                let newFiber = null;
+                
+                const sameType = oldFiber && child && child.type === oldFiber.type;
+                
+                if (sameType) {
+                    newFiber = {
+                        type: child.type,
+                        props: child.props,
+                        children: child.children,
+                        parent: fiber,
+                        dom: oldFiber.dom,
+                        alternate: oldFiber,
+                        effectTag: 'UPDATE',
+                    };
+                }
+                
+                if (child && !sameType) {
+                    newFiber = {
+                        type: child.type,
+                        props: child.props,
+                        children: child.children,
+                        parent: fiber,
+                        dom: null,
+                        alternate: null,
+                        effectTag: 'PLACEMENT',
+                    };
+                }
+                
+                if (oldFiber && !sameType) {
+                    oldFiber.effectTag = 'DELETION';
+                    deletions.push(oldFiber);
+                }
+                
+                if (oldFiber) {
+                    oldFiber = oldFiber.sibling;
+                }
+                
+                if (index === 0) {
+                    fiber.child = newFiber;
+                } else if (prevChild) {
+                    prevChild.sibling = newFiber;
+                }
+                
+                prevChild = newFiber;
+                index++;
+            }
+        }
+
+        // ========== 6. 提交变更到 DOM ==========
+        function commitRoot() {
+            // 先处理删除
+            deletions.forEach(commitWork);
+            // 提交根节点
+            commitWork(wipRoot.child);
+            // 保存当前根节点
+            currentRoot = wipRoot;
+            // 清空工作区
+            wipRoot = null;
+        }
+
+        function commitWork(fiber) {
+            if (!fiber) return;
+            
+            // 找到有 DOM 节点的父节点
+            let domParentFiber = fiber.parent;
+            while (!domParentFiber.dom) {
+                domParentFiber = domParentFiber.parent;
+            }
+            const domParent = domParentFiber.dom;
+            
+            if (fiber.effectTag === 'PLACEMENT' && fiber.dom) {
+                // 新增节点
+                domParent.appendChild(fiber.dom);
+            } else if (fiber.effectTag === 'UPDATE' && fiber.dom) {
+                // 更新节点
+                updateDomProperties(fiber.dom, fiber.alternate.props, fiber.props);
+            } else if (fiber.effectTag === 'DELETION') {
+                // 删除节点
+                commitDeletion(fiber, domParent);
+                return;
+            }
+            
+            // 递归提交子节点和兄弟节点
+            commitWork(fiber.child);
+            commitWork(fiber.sibling);
+        }
+
+        function commitDeletion(fiber, domParent) {
+            if (fiber.dom) {
+                domParent.removeChild(fiber.dom);
+            } else {
+                // 如果当前 fiber 没有 dom，递归查找子节点
+                commitDeletion(fiber.child, domParent);
+            }
+        }
+
+        // ========== 7. useState Hook（Fiber 版本）==========
+        let wipFiber = null;
+        let hookIndex = null;
+
+        function useState(initialValue) {
+            // 获取当前 fiber 的旧 hooks
+            const oldHook = wipFiber.alternate?.hooks?.[hookIndex];
+            const hook = {
+                state: oldHook ? oldHook.state : initialValue,
+                queue: [],
+            };
+            
+            // 处理旧的更新队列
+            const actions = oldHook?.queue || [];
+            actions.forEach(action => {
+                hook.state = typeof action === 'function' ? action(hook.state) : action;
+            });
+            
+            // 创建 setter
+            const setState = (action) => {
+                hook.queue.push(action);
+                // 触发重新渲染
+                wipRoot = {
+                    dom: currentRoot.dom,
+                    props: currentRoot.props,
+                    alternate: currentRoot,
+                };
+                nextUnitOfWork = wipRoot;
+                deletions = [];
+            };
+            
+            // 保存当前 hook
+            wipFiber.hooks = wipFiber.hooks || [];
+            wipFiber.hooks.push(hook);
+            
+            hookIndex++;
+            
+            return [hook.state, setState];
+        }
+
+        // ========== 8. 创建根节点 ==========
+        function createRoot(container) {
+            return {
+                render: (Component) => {
+                    render(createElement(Component), container);
+                }
+            };
+        }
+
+        // ========== 9. 演示组件 ==========
+        
+        // 模拟耗时渲染的大组件
+        function HeavyComponent() {
+            const items = [];
+            for (let i = 0; i < 5000; i++) {
+                items.push(createElement('div', { key: i, style: 'padding: 2px; font-size: 12px' }, 
+                    `Item ${i} - ${Math.random().toString(36).substring(7)}`
+                ));
+            }
+            return createElement('div', {}, ...items);
+        }
+        
+        // 计数器组件
+        function Counter() {
+            const [count, setCount] = useState(0);
+            const [showHeavy, setShowHeavy] = useState(false);
+            
+            const style = {
+                padding: '20px',
+                border: '1px solid #ccc',
+                borderRadius: '5px',
+                margin: '10px 0'
+            };
+            
+            return createElement('div', { style },
+                createElement('h2', {}, 'Fiber 架构演示'),
+                createElement('p', {}, `计数: ${count}`),
+                createElement('button', { 
+                    onClick: () => setCount(c => c + 1),
+                    style: 'margin-right: 10px'
+                }, '增加'),
+                createElement('button', { 
+                    onClick: () => setCount(0)
+                }, '重置'),
+                createElement('hr', {}),
+                createElement('button', { 
+                    onClick: () => setShowHeavy(s => !s),
+                    style: 'background: #28a745'
+                }, showHeavy ? '隐藏' : '显示大型组件（5000项）'),
+                showHeavy && createElement(HeavyComponent)
+            );
+        }
+        
+        // TodoList 组件
+        function TodoList() {
+            const [todos, setTodos] = useState([
+                { id: 1, text: '理解 Fiber 架构', done: false },
+                { id: 2, text: '学习可中断渲染', done: false },
+                { id: 3, text: '掌握 requestIdleCallback', done: false },
+            ]);
+            const [input, setInput] = useState('');
+            
+            const addTodo = () => {
+                if (!input.trim()) return;
+                setTodos(prev => [...prev, { id: Date.now(), text: input, done: false }]);
+                setInput('');
+            };
+            
+            const toggleTodo = (id) => {
+                setTodos(prev => prev.map(t => 
+                    t.id === id ? { ...t, done: !t.done } : t
+                ));
+            };
+            
+            const removeTodo = (id) => {
+                setTodos(prev => prev.filter(t => t.id !== id));
+            };
+            
+            return createElement('div', { className: 'component' },
+                createElement('h3', {}, 'TodoList (Fiber 版)'),
+                createElement('div', {},
+                    createElement('input', {
+                        value: input,
+                        placeholder: '添加新任务...',
+                        onInput: (e) => setInput(e.target.value),
+                    }),
+                    createElement('button', { onClick: addTodo }, '添加'),
+                ),
+                ...todos.map(todo =>
+                    createElement('div', { key: todo.id, className: 'todo-item' },
+                        createElement('input', {
+                            type: 'checkbox',
+                            checked: todo.done,
+                            onChange: () => toggleTodo(todo.id),
+                        }),
+                        createElement('span', { 
+                            style: todo.done ? 'text-decoration: line-through' : '' 
+                        }, todo.text),
+                        createElement('button', { 
+                            onClick: () => removeTodo(todo.id),
+                            style: 'background: #dc3545'
+                        }, '删除'),
+                    )
+                ),
+                createElement('p', { className: 'stats' }, 
+                    `总计: ${todos.length} | 已完成: ${todos.filter(t => t.done).length}`
+                )
+            );
+        }
+
+        // 性能监控组件
+        function PerformanceMonitor() {
+            const [renderCount, setRenderCount] = useState(0);
+            const [isHeavy, setIsHeavy] = useState(false);
+            
+            const handleHeavyRender = () => {
+                setIsHeavy(true);
+                setRenderCount(c => c + 1);
+                
+                // 模拟耗时操作后关闭
+                setTimeout(() => setIsHeavy(false), 100);
+            };
+            
+            return createElement('div', { className: 'component' },
+                createElement('h3', {}, 'Fiber 性能演示'),
+                createElement('p', {}, `渲染次数: ${renderCount}`),
+                createElement('button', { onClick: () => setRenderCount(c => c + 1) }, '轻量更新'),
+                createElement('button', { onClick: handleHeavyRender, style: 'background: #ff9800' }, '触发大型渲染'),
+                isHeavy && createElement(HeavyComponent),
+                createElement('div', { className: 'progress-bar' },
+                    createElement('div', { className: 'progress-fill', style: { width: '0%' } })
+                ),
+                createElement('p', { className: 'stats' }, 
+                    '💡 提示: 大型渲染会被拆分为多个小任务，不会阻塞 UI'
+                )
+            );
+        }
+
+        // ========== 10. 启动应用 ==========
+        const root = createRoot(document.getElementById('root'));
+        // 可以选择不同的组件测试
+        root.render(Counter);
+        // root.render(TodoList);
+        // root.render(PerformanceMonitor);
+        
+        // 添加性能标记
+        console.log('Fiber 架构已启动！');
+        console.log('打开 Performance 面板，观察任务是否被切片执行');
+    </script>
+</body>
+</html>
